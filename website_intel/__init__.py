@@ -1,18 +1,42 @@
-import subprocess, json, logging
+import subprocess, json, logging, re
+import requests
 
 logger = logging.getLogger(__name__)
 
+TECH_SIGNATURES = {
+    "WordPress": [r"wp-content", r"wp-includes", r"/wp-json/"],
+    "Shopify": [r"cdn\.shopify\.com", r"Shopify\.theme"],
+    "Wix": [r"static\.wixstatic\.com", r"wix\.com"],
+    "Squarespace": [r"squarespace\.com", r"static1\.squarespace\.com"],
+    "Webflow": [r"webflow\.com", r"webflow\.js"],
+    "GoDaddy Website Builder": [r"godaddy\.com/websitebuilder", r"gdbuilder"],
+    "jQuery": [r"jquery(\.min)?\.js"],
+    "React": [r"react(-dom)?(\.min)?\.js", r"__REACT_DEVTOOLS"],
+    "Google Analytics": [r"google-analytics\.com", r"gtag\("],
+    "Google Tag Manager": [r"googletagmanager\.com"],
+    "Facebook Pixel": [r"connect\.facebook\.net.*fbevents"],
+    "Cloudflare": [r"cloudflare"],
+    "HubSpot": [r"hs-scripts\.com", r"hubspot"],
+}
+
 def run_wappalyzer(url: str) -> dict:
     try:
-        result = subprocess.run(
-            ["wappalyzer", url, "-o", "json"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            return json.loads(result.stdout)
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        html = resp.text
+        headers_text = json.dumps(dict(resp.headers)).lower()
+        combined = (html + headers_text).lower()
+
+        found = []
+        for tech, patterns in TECH_SIGNATURES.items():
+            if any(re.search(p, combined, re.IGNORECASE) for p in patterns):
+                found.append(tech)
+
+        return {"technologies": found, "status_code": resp.status_code}
+
     except Exception as e:
-        logger.error(f"Wappalyzer error: {e}")
-    return {}
+        logger.error(f"Tech detection error: {e}")
+        return {"technologies": [], "status_code": None}
+
 
 def run_lighthouse(url: str) -> dict:
     try:
