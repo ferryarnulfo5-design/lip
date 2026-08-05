@@ -3,64 +3,56 @@ import subprocess, json, logging, os, signal
 logger = logging.getLogger(__name__)
 
 
-def _kill_process_group(pid):
-    """পুরো প্রসেস গ্রুপকে SIGKILL পাঠায় (zombie/child chrome এড়াতে)।"""
-    if not pid or pid <= 0:
-        return
+def _terminate_and_drain(proc, drain_timeout=5):
+    """
+    প্রসেসকে (এবং তার পুরো process group কে) কিল করে, তারপর stdout/stderr
+    pipe খালি (drain) করে দেয়।
+
+    communicate(timeout=...) টাইমআউট হলে pipe এখনো খোলা ও unread থাকে। kill
+    করার পর সরাসরি wait() কল করা বিপজ্জনক — child kill হওয়ার আগেই pipe
+    buffer এ (OS বাফার সাধারণত ~64KB) অনেক ডেটা লিখে রাখলে এবং সেটা কেউ read
+    না করলে, wait() অনির্দিষ্টকালের জন্য আটকে (deadlock) যেতে পারে। তাই kill
+    এর পরও wait() না করে communicate() কল করা হচ্ছে, যাতে বাকি output read
+    করে pipe খালি হয়ে যায় এবং zombie/hang এড়ানো যায়।
+    """
     try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except ProcessLookupError:
         pass
     except Exception as e:
-        logger.debug(f"প্রসেস গ্রুপ কিল করতে সমস্যা: {e}")
+        logger.debug(f"কিল করতে সমস্যা: {e}")
 
-
-def _terminate_and_drain(proc, label, url):
-    """
-    টাইমআউট হওয়া প্রসেসকে কিল করে এবং pipe বাফার খালি (drain) করে।
-
-    ⚠️ গুরুত্বপূর্ণ: kill()-এর পর proc.wait() না করে proc.communicate()
-    করতে হবে। কারণ child process kill হওয়ার আগেই stdout/stderr pipe-এ
-    অনেক ডেটা (OS pipe buffer, সাধারণত ~64KB) লিখে ফেলতে পারে। সেটা কেউ
-    read না করলে wait() অনির্দিষ্টকালের জন্য ব্লক (deadlock) হয়ে যায় —
-    এটাই আসল কারণ ছিল আগের hang-এর পেছনে।
-    """
-    logger.warning(f"{label} টাইমআউট: {url}")
-    _kill_process_group(proc.pid)
     try:
-        proc.kill()  # গ্রুপ কিল fail করলে fallback হিসেবে সরাসরি kill
-    except Exception:
-        pass
-    try:
-        # wait() নয়, communicate() — যাতে pipe drain হয় এবং deadlock না হয়
-        proc.communicate(timeout=5)
+        proc.communicate(timeout=drain_timeout)
     except subprocess.TimeoutExpired:
-        logger.error(f"{label}: kill করার পরও প্রসেস ৫ সেকেন্ডে সাড়া দেয়নি: {url}")
+        logger.warning(f"drain timeout — pipe পুরোপুরি খালি করা যায়নি (pid={proc.pid})")
     except Exception as e:
-        logger.debug(f"{label} drain করতে সমস্যা: {e}")
+        logger.debug(f"drain করতে সমস্যা: {e}")
 
 
 def run_wappalyzer(url: str) -> dict:
-    proc = None
     try:
         proc = subprocess.Popen(
             ["wappalyzer", url, "-o", "json"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,  # নতুন প্রসেস গ্রুপ, killpg-এর জন্য দরকার
+            start_new_session=True,  # নতুন প্রসেস গ্রুপ
         )
         try:
             stdout, stderr = proc.communicate(timeout=30)
             if proc.returncode == 0:
-                return json.loads(stdout)
-            logger.warning(f"Wappalyzer non-zero exit {proc.returncode}: {stderr[:200]}")
-            return {}
+                try:
+                    return json.loads(stdout)
+                except json.JSONDecodeError:
+                    logger.warning(f"Wappalyzer invalid JSON output: {url}")
+                    return {}
+            else:
+                logger.warning(f"Wappalyzer non-zero exit {proc.returncode}: {stderr[:200]}")
+                return {}
         except subprocess.TimeoutExpired:
-            _terminate_and_drain(proc, "Wappalyzer", url)
-            return {}
-        except json.JSONDecodeError as e:
-            logger.warning(f"Wappalyzer output parse করতে সমস্যা: {e}")
+            logger.warning(f"Wappalyzer টাইমআউট: {url}")
+            _terminate_and_drain(proc)
             return {}
     except Exception as e:
         logger.error(f"Wappalyzer error: {e}")
@@ -68,7 +60,6 @@ def run_wappalyzer(url: str) -> dict:
 
 
 def run_lighthouse(url: str) -> dict:
-    proc = None
     try:
         proc = subprocess.Popen(
             ["lighthouse", url, "--output=json", "--chrome-flags=--headless --no-sandbox", "--quiet"],
@@ -78,20 +69,23 @@ def run_lighthouse(url: str) -> dict:
             start_new_session=True,
         )
         try:
-            stdout, stderr = proc.communicate(timeout=60)
+            stdout, stderr = proc.communicate(timeout=60)  # ১ মিনিট
             if proc.returncode == 0:
-                report = json.loads(stdout)
+                try:
+                    report = json.loads(stdout)
+                except json.JSONDecodeError:
+                    logger.warning(f"Lighthouse invalid JSON output: {url}")
+                    return {"performance_score": None, "seo_score": None}
                 categories = report.get("categories", {})
                 perf = categories.get("performance", {}).get("score", None)
                 seo = categories.get("seo", {}).get("score", None)
                 return {"performance_score": perf, "seo_score": seo}
-            logger.warning(f"Lighthouse exit {proc.returncode}: {stderr[:200]}")
-            return {"performance_score": None, "seo_score": None}
+            else:
+                logger.warning(f"Lighthouse exit {proc.returncode}: {stderr[:200]}")
+                return {"performance_score": None, "seo_score": None}
         except subprocess.TimeoutExpired:
-            _terminate_and_drain(proc, "Lighthouse", url)
-            return {"performance_score": None, "seo_score": None}
-        except json.JSONDecodeError as e:
-            logger.warning(f"Lighthouse output parse করতে সমস্যা: {e}")
+            logger.warning(f"Lighthouse টাইমআউট (60s): {url}")
+            _terminate_and_drain(proc)
             return {"performance_score": None, "seo_score": None}
     except Exception as e:
         logger.error(f"Lighthouse error: {e}")
