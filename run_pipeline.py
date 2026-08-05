@@ -38,7 +38,7 @@ def find_website_column_by_content(df):
         matches = sample.apply(lambda x: bool(URL_PATTERN.search(x))).sum()
         if matches > best_score:
             best_col, best_score = col, matches
-    return best_col if best_score >= 3 else None  # অন্তত ৩টা সারিতে মিললে তবেই ভরসা করা
+    return best_col if best_score >= 3 else None
 
 def load_input(input_path):
     path = Path(input_path)
@@ -51,7 +51,7 @@ def load_input(input_path):
         if ext in (".xlsx", ".xls"):
             df = pd.read_excel(path, dtype=str)
         else:
-            df = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+            df = pd.read_csv(path, dtype=str, encoding="utf-8-sig", sep=None, engine="python")
     except Exception as e:
         logger.error(f"ফাইল পড়তে সমস্যা হয়েছে: {e}")
         sys.exit(1)
