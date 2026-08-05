@@ -14,7 +14,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 from crawler.business_spider import crawl_website
 from email_verifier.verifier import verify_email_batch
 from decision_maker.extractor import extract_decision_makers
-from website_intel import run_wappalyzer, run_lighthouse
+from website_intel import detect_technologies, run_lighthouse
 from ai.qualify import qualify_lead
 from ai.outreach import generate_outreach
 
@@ -95,7 +95,7 @@ def process_site(name, website):
         emails = extract_emails_from_pages(pages)
         verified = verify_email_batch(emails)
         people = extract_decision_makers(pages)
-        tech = run_wappalyzer(website)
+        tech = detect_technologies(website)
         lh_report = run_lighthouse(website)
         lead_score = qualify_lead(website, people, tech, lh_report, OLLAMA_HOST)
         outreach = generate_outreach(website, people, lead_score, OLLAMA_HOST)
