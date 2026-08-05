@@ -58,7 +58,7 @@ jobs:
 
       - name: Install Node tools
         run: |
-          npm install -g lighthouse
+          npm install -g lighthouse wappalyzer
 
       - name: Pull Ollama model (tinyllama)
         run: |
