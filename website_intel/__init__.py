@@ -1,55 +1,72 @@
-import subprocess, json, logging, re
-import requests
+import subprocess, json, logging, os, signal
 
 logger = logging.getLogger(__name__)
 
-TECH_SIGNATURES = {
-    "WordPress": [r"wp-content", r"wp-includes", r"/wp-json/"],
-    "Shopify": [r"cdn\.shopify\.com", r"Shopify\.theme"],
-    "Wix": [r"static\.wixstatic\.com", r"wix\.com"],
-    "Squarespace": [r"squarespace\.com", r"static1\.squarespace\.com"],
-    "Webflow": [r"webflow\.com", r"webflow\.js"],
-    "GoDaddy Website Builder": [r"godaddy\.com/websitebuilder", r"gdbuilder"],
-    "jQuery": [r"jquery(\.min)?\.js"],
-    "React": [r"react(-dom)?(\.min)?\.js", r"__REACT_DEVTOOLS"],
-    "Google Analytics": [r"google-analytics\.com", r"gtag\("],
-    "Google Tag Manager": [r"googletagmanager\.com"],
-    "Facebook Pixel": [r"connect\.facebook\.net.*fbevents"],
-    "Cloudflare": [r"cloudflare"],
-    "HubSpot": [r"hs-scripts\.com", r"hubspot"],
-}
+def _kill_process_tree(pid, timeout=5):
+    """পুরো প্রসেস ট্রি কিল করে (zombie এড়াতে)"""
+    if pid <= 0:
+        return
+    try:
+        # পুরো গ্রুপ কিল
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        logger.debug(f"কিল করতে সমস্যা: {e}")
 
 def run_wappalyzer(url: str) -> dict:
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        html = resp.text
-        headers_text = json.dumps(dict(resp.headers)).lower()
-        combined = (html + headers_text).lower()
-
-        found = []
-        for tech, patterns in TECH_SIGNATURES.items():
-            if any(re.search(p, combined, re.IGNORECASE) for p in patterns):
-                found.append(tech)
-
-        return {"technologies": found, "status_code": resp.status_code}
-
+        # ৩০ সেকেন্ডের টাইমআউট, প্রসেস গ্রুপ তৈরি
+        proc = subprocess.Popen(
+            ["wappalyzer", url, "-o", "json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True  # নতুন প্রসেস গ্রুপ
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=30)
+            if proc.returncode == 0:
+                return json.loads(stdout)
+            else:
+                logger.warning(f"Wappalyzer non-zero exit {proc.returncode}: {stderr[:200]}")
+                return {}
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Wappalyzer টাইমআউট: {url}")
+            _kill_process_tree(proc.pid)
+            proc.kill()
+            proc.wait(timeout=5)
+            return {}
     except Exception as e:
-        logger.error(f"Tech detection error: {e}")
-        return {"technologies": [], "status_code": None}
-
+        logger.error(f"Wappalyzer error: {e}")
+        return {}
 
 def run_lighthouse(url: str) -> dict:
     try:
-        result = subprocess.run(
-            ["lighthouse", url, "--output=json", "--chrome-flags=--headless", "--quiet"],
-            capture_output=True, text=True, timeout=60
+        proc = subprocess.Popen(
+            ["lighthouse", url, "--output=json", "--chrome-flags=--headless --no-sandbox", "--quiet"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True
         )
-        if result.returncode == 0:
-            report = json.loads(result.stdout)
-            categories = report.get("categories", {})
-            perf = categories.get("performance", {}).get("score", None)
-            seo = categories.get("seo", {}).get("score", None)
-            return {"performance_score": perf, "seo_score": seo}
+        try:
+            stdout, stderr = proc.communicate(timeout=60)  # ১ মিনিট
+            if proc.returncode == 0:
+                report = json.loads(stdout)
+                categories = report.get("categories", {})
+                perf = categories.get("performance", {}).get("score", None)
+                seo = categories.get("seo", {}).get("score", None)
+                return {"performance_score": perf, "seo_score": seo}
+            else:
+                logger.warning(f"Lighthouse exit {proc.returncode}: {stderr[:200]}")
+                return {"performance_score": None, "seo_score": None}
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Lighthouse টাইমআউট (60s): {url}")
+            _kill_process_tree(proc.pid)
+            proc.kill()
+            proc.wait(timeout=5)
+            return {"performance_score": None, "seo_score": None}
     except Exception as e:
         logger.error(f"Lighthouse error: {e}")
-    return {"performance_score": None, "seo_score": None}
+        return {"performance_score": None, "seo_score": None}
