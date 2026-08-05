@@ -1,7 +1,7 @@
 name: Full Lead Intelligence Pipeline (Batch)
 
 on:
-  workflow_dispatch:    # ম্যানুয়াল ট্রিগার
+  workflow_dispatch:
 
 jobs:
   run-pipeline:
@@ -62,7 +62,6 @@ jobs:
 
       - name: Pull Ollama model (tinyllama)
         run: |
-          # Wait for Ollama to start
           for i in {1..30}; do
             if curl -s http://localhost:11434/api/tags > /dev/null; then
               echo "Ollama ready"
@@ -73,21 +72,18 @@ jobs:
           done
           docker exec ollama_container ollama pull tinyllama:latest
 
-      - name: Prepare input (sample list)
-        run: |
-          mkdir -p input
-          if [ ! -f input/business_list.csv ]; then
-            echo "name,website" > input/business_list.csv
-            # আপনার নিজের লিস্ট দিতে পারেন এই ফরম্যাটে
-            echo "Example Corp,example.com" >> input/business_list.csv
-            echo "Test Agency,test.com" >> input/business_list.csv
-          fi
-
       - name: Run full pipeline
         env:
           DATABASE_URL: postgresql://lead_user:lead_pass@localhost:5432/lead_intel
           OLLAMA_HOST: http://localhost:11434
-        run: python run_pipeline.py --input input/business_list.csv
+        run: |
+          FILE=$(find input -maxdepth 1 -type f \( -name "*.csv" -o -name "*.xlsx" \) | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "input/ ফোল্ডারে কোনো .csv বা .xlsx ফাইল পাওয়া যায়নি।"
+            exit 1
+          fi
+          echo "Using input file: $FILE"
+          python run_pipeline.py --input "$FILE"
 
       - name: Upload enriched leads
         uses: actions/upload-artifact@v4
