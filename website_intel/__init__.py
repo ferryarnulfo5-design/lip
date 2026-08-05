@@ -1,5 +1,5 @@
 import subprocess, json, logging, os, signal
-
+from .tech_detector import detect_technologies
 logger = logging.getLogger(__name__)
 
 
