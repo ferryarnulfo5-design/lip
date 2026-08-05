@@ -3,3 +3,5 @@ beautifulsoup4
 spacy
 click
 typer
+pandas
+openpyxl
