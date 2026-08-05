@@ -1,5 +1,7 @@
-import argparse, csv, json, logging, os, re, sys, time, threading
+import argparse, csv, json, logging, os, re, sys, threading, time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -21,11 +23,10 @@ NAME_CANDIDATES = ["name", "business", "business_name", "company", "company name
 
 URL_PATTERN = re.compile(r"(https?://)?(www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}")
 
-SITE_TIMEOUT_SEC = 180  # প্রতিটা সাইট প্রসেস করার জন্য সর্বোচ্চ সময় (৩ মিনিট)
+MAX_WORKERS = 5          # একসাথে কয়টা সাইট প্রসেস হবে (default; --workers দিয়ে বদলানো যায়)
+SITE_TIMEOUT_SEC = 180   # প্রতিটা সাইটের জন্য hard cap — এর বেশি লাগলে বাদ দিয়ে পরের সাইটে
 
-
-class SiteProcessingError(Exception):
-    pass
+_write_lock = threading.Lock()
 
 
 def find_column(df, candidates):
@@ -78,8 +79,17 @@ def extract_emails_from_pages(pages):
     return list(emails)
 
 
-def process_site(website, name):
-    """একটি সাইটের পুরো পাইপলাইন চালায় (crawl -> emails -> people -> tech -> lighthouse -> AI scoring)।"""
+class SiteProcessingError(Exception):
+    """একটা সাইট প্রসেস করতে গিয়ে যেকোনো ধরনের ব্যর্থতার জন্য।"""
+    pass
+
+
+def process_site(name, website):
+    """
+    একটা সাইটের জন্য পুরো enrichment pipeline চালায়। থ্রেড-সেফ — কোনো shared
+    state লেখে না, শুধু dict রিটার্ন করে। একাধিক থ্রেড থেকে সমান্তরালে কল
+    করা নিরাপদ।
+    """
     try:
         pages = crawl_website(website)
         emails = extract_emails_from_pages(pages)
@@ -90,7 +100,7 @@ def process_site(website, name):
         lead_score = qualify_lead(website, people, tech, lh_report, OLLAMA_HOST)
         outreach = generate_outreach(website, people, lead_score, OLLAMA_HOST)
 
-        result = {
+        return {
             "business_name": name,
             "website": website,
             "emails": ";".join(verified),
@@ -102,55 +112,44 @@ def process_site(website, name):
             "outreach_subject": outreach.get("subject", ""),
             "outreach_body": outreach.get("body", ""),
         }
-        logger.info(f"✅ Done: {len(verified)} emails, {len(people)} people")
-        return result
-
     except Exception as e:
-        logger.error(f"❌ Failed {name}: {str(e)}")
-        return {"business_name": name, "website": website, "error": str(e)}
+        raise SiteProcessingError(str(e)) from e
 
 
-def run_with_timeout(func, args=(), kwargs=None, timeout_sec=SITE_TIMEOUT_SEC):
+def run_with_timeout(fn, args=(), timeout=SITE_TIMEOUT_SEC):
     """
-    func-কে নির্দিষ্ট সময়ের মধ্যে শেষ হতে বাধ্য করে।
-    টাইমআউট হলে মূল পাইপলাইন এগিয়ে যায় (থ্রেড daemon হওয়ায় ব্যাকগ্রাউন্ডে ছেড়ে দেওয়া হয়)।
+    fn কে একটা আলাদা (ডেমন) থ্রেডে চালায়। timeout সেকেন্ডের মধ্যে শেষ না
+    হলে TimeoutError তুলে মূল থ্রেড এগিয়ে যায়, যাতে একটা সাইট পুরো
+    pipeline কে আটকে না রাখে।
 
-    ⚠️ সীমাবদ্ধতা: Python থ্রেড জোর করে kill করা যায় না। তাই ভেতরের
-    subprocess (যেমন lighthouse/chrome) টাইমআউটের পরও চলতে থাকতে পারে।
-    এটা শুধু pipeline-কে আটকে যাওয়া থেকে বাঁচায়, subprocess leak বন্ধ করে না।
-    আসল fix website_intel.run_lighthouse()-এ subprocess-level kill যোগ করা।
+    সতর্কতা: Python এ থ্রেড জোর করে kill করা যায় না, তাই timeout হলেও এই
+    থ্রেডের ভেতরের কাজ (এবং তার থেকে spawn হওয়া subprocess, যদি নিজে থেকে
+    টাইমআউট/kill না হয়) ব্যাকগ্রাউন্ডে চলতে থাকতে পারে। এজন্যই
+    website_intel/__init__.py এর subprocess-level কিল+drain fix টা জরুরি —
+    এটা সেই safety net এর উপরের স্তর, প্রতিস্থাপন না।
     """
-    kwargs = kwargs or {}
-    result_container = []
-    exception_container = []
+    result = {}
+    error = {}
 
-    def worker():
+    def target():
         try:
-            result_container.append(func(*args, **kwargs))
+            result["value"] = fn(*args)
         except Exception as e:
-            exception_container.append(e)
+            error["value"] = e
 
-    thread = threading.Thread(target=worker)
-    thread.daemon = True
-    thread.start()
-    thread.join(timeout=timeout_sec)
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout)
 
-    if thread.is_alive():
-        website = args[0] if len(args) > 0 else ""
-        name = args[1] if len(args) > 1 else ""
-        logger.error(f"⏰ টাইমআউট ({timeout_sec}s) পেরিয়ে গেছে: {name} ({website})")
-        return {"business_name": name, "website": website, "error": f"Site processing timeout after {timeout_sec}s"}
-
-    if exception_container:
-        raise exception_container[0]
-
-    return result_container[0] if result_container else {}
+    if t.is_alive():
+        raise TimeoutError(f"{timeout}s এর মধ্যে শেষ হয়নি")
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
 
 
-def run_pipeline(input_csv):
+def run_pipeline(input_csv, max_workers=MAX_WORKERS, site_timeout=SITE_TIMEOUT_SEC):
     Path("output").mkdir(exist_ok=True)
-    enriched = []
-
     df = load_input(input_csv)
 
     website_col = find_column(df, WEBSITE_NAME_CANDIDATES) or find_website_column_by_content(df)
@@ -161,6 +160,7 @@ def run_pipeline(input_csv):
 
     name_col = find_column(df, NAME_CANDIDATES)
 
+    tasks = []
     for idx, row in df.iterrows():
         website = str(row[website_col]).strip()
         if not website or website.lower() == "nan":
@@ -168,36 +168,64 @@ def run_pipeline(input_csv):
             continue
         if not website.startswith("http"):
             website = f"https://{website}"
-
         name = str(row[name_col]).strip() if name_col else website
-        logger.info(f"Processing {idx+1}: {name} ({website})")
+        tasks.append((idx, name, website))
 
+    total = len(tasks)
+    if total == 0:
+        logger.warning("প্রসেস করার মতো কোনো সাইট পাওয়া যায়নি।")
+        return
+
+    logger.info(f"{total}টা সাইট, {max_workers}টা worker দিয়ে শুরু হচ্ছে (per-site timeout {site_timeout}s)")
+
+    fieldnames = [
+        "business_name", "website", "emails", "decision_makers", "tech_stack",
+        "lighthouse_score", "lead_score", "ai_summary", "outreach_subject",
+        "outreach_body", "error",
+    ]
+
+    output_csv = "output/enriched_leads.csv"
+    # হেডার আগেই লিখে, প্রতিটা রেজাল্ট আসার সাথে সাথে append করা হচ্ছে —
+    # কোনো worker/runner মাঝপথে ক্র্যাশ করলেও এতক্ষণের কাজ হারাবে না।
+    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+
+    def worker(task):
+        idx, name, website = task
+        logger.info(f"শুরু {idx + 1}/{total}: {name} ({website})")
         try:
-            record = run_with_timeout(
-                process_site,
-                args=(website, name),
-                timeout_sec=SITE_TIMEOUT_SEC,
-            )
+            row = run_with_timeout(process_site, args=(name, website), timeout=site_timeout)
+            logger.info(f"✅ শেষ: {name}")
+            return row
+        except TimeoutError:
+            logger.error(f"⏱️ টাইমআউট ({site_timeout}s) — বাদ দিয়ে এগোচ্ছি: {name}")
+            return {"business_name": name, "website": website, "error": f"timeout after {site_timeout}s"}
+        except SiteProcessingError as e:
+            logger.error(f"❌ ব্যর্থ {name}: {e}")
+            return {"business_name": name, "website": website, "error": str(e)}
         except Exception as e:
-            logger.error(f"❌ Failed {name}: {str(e)}")
-            record = {"business_name": name, "website": website, "error": str(e)}
+            logger.error(f"❌ অপ্রত্যাশিত এরর {name}: {e}")
+            return {"business_name": name, "website": website, "error": str(e)}
 
-        enriched.append(record)
-        time.sleep(2)
+    done_count = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(worker, task) for task in tasks]
+        for future in as_completed(futures):
+            row = future.result()
+            with _write_lock:
+                with open(output_csv, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writerow({k: row.get(k, "") for k in fieldnames})
+            done_count += 1
+            logger.info(f"অগ্রগতি: {done_count}/{total}")
 
-    if enriched:
-        output_csv = "output/enriched_leads.csv"
-        with open(output_csv, "w", newline="", encoding="utf-8") as out:
-            writer = csv.DictWriter(out, fieldnames=enriched[0].keys())
-            writer.writeheader()
-            writer.writerows(enriched)
-        logger.info(f"🎉 Pipeline complete. Output: {output_csv}")
-    else:
-        logger.warning("কোনো ফলাফল তৈরি হয়নি।")
+    logger.info(f"🎉 Pipeline complete. Output: {output_csv}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Input CSV or XLSX file path")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help="সমান্তরাল worker সংখ্যা (default: 5)")
+    parser.add_argument("--site-timeout", type=int, default=SITE_TIMEOUT_SEC, help="প্রতি সাইটের hard timeout, সেকেন্ডে (default: 180)")
     args = parser.parse_args()
-    run_pipeline(args.input)
+    run_pipeline(args.input, max_workers=args.workers, site_timeout=args.site_timeout)
